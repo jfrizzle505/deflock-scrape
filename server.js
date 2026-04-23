@@ -65,6 +65,7 @@ async function scrapeDeFlock() {
   let browser;
   const intercepted = [];
   let apiEndpointFound = null;
+  const allRequests = []; // log every network request URL
 
   try {
     browser = await chromium.launch({
@@ -74,115 +75,202 @@ async function scrapeDeFlock() {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
-        '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        '--disable-web-security',
+        '--allow-running-insecure-content',
       ]
     });
 
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1440, height: 900 },
       locale: 'en-US',
       timezoneId: 'America/Chicago',
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      }
     });
 
     const page = await context.newPage();
 
-    // Intercept all network responses to find API calls
+    // ── Strategy 1: Intercept ALL network responses ────
     page.on('response', async response => {
-      const url  = response.url();
-      const ct   = response.headers()['content-type'] || '';
-      // Look for JSON responses from deflock.me
-      if (url.includes('deflock.me') && (ct.includes('json') || ct.includes('geo'))) {
+      const url = response.url();
+      const ct  = response.headers()['content-type'] || '';
+      allRequests.push({ url, ct, status: response.status() });
+
+      // Catch any JSON from any domain (deflock may use a CDN or separate API domain)
+      if (ct.includes('json') || ct.includes('geo') || url.endsWith('.json') || url.endsWith('.geojson')) {
         try {
-          const body = await response.json();
+          const body = await response.json().catch(() => null);
+          if (!body) return;
           const parsed = parseCameraData(body);
           if (parsed.length > 0) {
-            console.log(`[intercept] Found ${parsed.length} cameras at: ${url}`);
+            console.log(`[intercept] ✓ ${parsed.length} cameras from: ${url}`);
             apiEndpointFound = url;
             intercepted.push(...parsed);
           }
-        } catch(e) { /* not valid JSON or no cameras */ }
+        } catch(e) {}
       }
     });
 
-    // Navigate to deflock.me
+    // ── Navigate ───────────────────────────────────────
     console.log('[scraper] Navigating to deflock.me…');
-    await page.goto('https://deflock.me', {
-      waitUntil: 'networkidle',
-      timeout: 30000
-    });
-
-    // Wait for map to load
-    await page.waitForTimeout(3000);
-
-    // Try panning the map to trigger data loads in different regions
-    // (some map apps load tiles as you pan)
     try {
-      const mapEl = await page.$('canvas, #map, .mapboxgl-map, .leaflet-container, [class*="map"]');
-      if (mapEl) {
-        const box = await mapEl.boundingBox();
-        if (box) {
-          // Pan around to trigger more data loads
-          await page.mouse.move(box.x + box.width/2, box.y + box.height/2);
-          await page.mouse.wheel(0, -300); // zoom in
-          await page.waitForTimeout(1500);
-          await page.mouse.wheel(0, -300);
-          await page.waitForTimeout(1500);
-        }
-      }
-    } catch(e) { /* map interaction failed, that's ok */ }
+      await page.goto('https://deflock.me', { waitUntil: 'networkidle', timeout: 45000 });
+    } catch(e) {
+      console.log('[scraper] networkidle timeout — continuing anyway');
+    }
 
-    // Also try to find and click any "load all" or "export" buttons
-    try {
-      const exportBtn = await page.$('[class*="export"], [class*="download"], button:has-text("Export"), button:has-text("Download"), a:has-text("GeoJSON")');
-      if (exportBtn) {
-        await exportBtn.click();
-        await page.waitForTimeout(2000);
-      }
-    } catch(e) {}
+    await page.waitForTimeout(5000);
 
-    // Wait for any pending requests
-    await page.waitForTimeout(2000);
-
-    // Try directly hitting known API paths via page.evaluate
-    // (runs in browser context — passes Cloudflare since browser is real)
-    const paths = [
-      '/api/cameras', '/api/v1/cameras', '/cameras.geojson',
-      '/data/cameras.json', '/api/locations', '/api/markers',
-      '/api/pins', '/api/v2/cameras', '/export/geojson'
-    ];
-
-    for (const p of paths) {
-      if (intercepted.length > 10) break; // already have data
+    // ── Strategy 2: Read page source for embedded data ─
+    if (intercepted.length === 0) {
+      console.log('[scraper] Trying embedded data extraction…');
       try {
-        const result = await page.evaluate(async (apiPath) => {
-          try {
-            const r = await fetch(apiPath, {
-              headers: { 'Accept': 'application/json, application/geo+json, */*' }
-            });
-            if (!r.ok) return null;
-            return await r.json();
-          } catch(e) { return null; }
-        }, p);
-
-        if (result) {
-          const parsed = parseCameraData(result);
+        const embedded = await page.evaluate(() => {
+          // Look for window.__data, window.__INITIAL_STATE__, window.mapData etc.
+          const candidates = [
+            window.__data, window.__INITIAL_STATE__, window.__NEXT_DATA__,
+            window.mapData, window.cameras, window.cameraData,
+            window.__nuxt__, window.__NUXT__, window.initialData,
+          ];
+          // Also search all script tags for JSON arrays with lat/lng
+          const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+          for (const s of scripts) {
+            const text = s.textContent || '';
+            // Look for arrays with latitude/longitude patterns
+            const match = text.match(/\[[\s\S]*?"(?:lat|latitude)"[\s\S]*?"(?:lng|lon|longitude)"[\s\S]*?\]/);
+            if (match) {
+              try { candidates.push(JSON.parse(match[0])); } catch(e) {}
+            }
+            // Look for GeoJSON
+            const geoMatch = text.match(/\{[\s\S]*?"FeatureCollection"[\s\S]*?\}/);
+            if (geoMatch) {
+              try { candidates.push(JSON.parse(geoMatch[0])); } catch(e) {}
+            }
+          }
+          return candidates.filter(Boolean);
+        });
+        for (const candidate of embedded) {
+          const parsed = parseCameraData(candidate);
           if (parsed.length > 0) {
-            console.log(`[eval] Found ${parsed.length} cameras at ${p}`);
-            apiEndpointFound = 'https://deflock.me' + p;
+            console.log(`[embedded] ✓ ${parsed.length} cameras from page data`);
+            apiEndpointFound = 'embedded-page-data';
             intercepted.push(...parsed);
-            break;
           }
         }
+      } catch(e) { console.log('[embedded] error:', e.message); }
+    }
+
+    // ── Strategy 3: Try API paths from within browser context ──
+    if (intercepted.length === 0) {
+      console.log('[scraper] Trying in-browser API fetch…');
+      const paths = [
+        '/api/cameras', '/api/v1/cameras', '/api/v2/cameras',
+        '/cameras.geojson', '/cameras.json', '/data/cameras.json',
+        '/api/locations', '/api/markers', '/api/pins',
+        '/export/geojson', '/export/cameras',
+        '/api/camera-locations', '/api/flock-cameras',
+        '/api/map/cameras', '/api/map/markers',
+        '/trpc/cameras.list', '/trpc/cameras.getAll',
+      ];
+      for (const p of paths) {
+        if (intercepted.length > 0) break;
+        try {
+          const result = await page.evaluate(async (apiPath) => {
+            try {
+              const r = await fetch(apiPath, {
+                credentials: 'include',
+                headers: { 'Accept': 'application/json, application/geo+json, */*' }
+              });
+              if (!r.ok) return null;
+              const ct = r.headers.get('content-type') || '';
+              if (!ct.includes('json') && !ct.includes('geo')) return null;
+              return await r.json();
+            } catch(e) { return null; }
+          }, p);
+          if (result) {
+            const parsed = parseCameraData(result);
+            if (parsed.length > 0) {
+              console.log(`[api-fetch] ✓ ${parsed.length} cameras at ${p}`);
+              apiEndpointFound = 'https://deflock.me' + p;
+              intercepted.push(...parsed);
+            }
+          }
+        } catch(e) {}
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+
+    // ── Strategy 4: Pan map to trigger tile/data loads ─
+    if (intercepted.length === 0) {
+      console.log('[scraper] Panning map to trigger data loads…');
+      try {
+        // Try clicking around the map to trigger data fetches
+        const w = 1440, h = 900;
+        const points = [
+          [w/2, h/2], [w*0.25, h/2], [w*0.75, h/2],
+          [w/2, h*0.25], [w/2, h*0.75]
+        ];
+        for (const [x, y] of points) {
+          await page.mouse.move(x, y);
+          await page.mouse.wheel(0, -500);
+          await page.waitForTimeout(2000);
+        }
+        // Wait for any triggered network requests
+        await page.waitForTimeout(3000);
       } catch(e) {}
+    }
+
+    // ── Strategy 5: Check all logged request URLs for data ─
+    if (intercepted.length === 0) {
+      console.log('[scraper] Checking all intercepted URLs…');
+      console.log('[scraper] All requests seen:', allRequests.map(r => `${r.status} ${r.url}`).join('\n'));
+    }
+
+    // ── Strategy 6: Try GraphQL ────────────────────────
+    if (intercepted.length === 0) {
+      console.log('[scraper] Trying GraphQL…');
+      const queries = [
+        '{ cameras { lat lng description address } }',
+        '{ locations { latitude longitude name } }',
+        '{ markers { lat lon label } }',
+        'query { cameras { id lat lng label createdAt } }',
+      ];
+      for (const query of queries) {
+        if (intercepted.length > 0) break;
+        try {
+          const result = await page.evaluate(async (q) => {
+            try {
+              const r = await fetch('/graphql', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify({ query: q })
+              });
+              if (!r.ok) return null;
+              return await r.json();
+            } catch(e) { return null; }
+          }, query);
+          if (result) {
+            const parsed = parseCameraData(result);
+            if (parsed.length > 0) {
+              console.log(`[graphql] ✓ ${parsed.length} cameras`);
+              apiEndpointFound = 'graphql';
+              intercepted.push(...parsed);
+            }
+          }
+        } catch(e) {}
+      }
     }
 
     await browser.close();
     browser = null;
 
-    // Deduplicate
     const deduped = deduplicateCameras(intercepted);
     console.log(`[scraper] Done. ${deduped.length} unique cameras found.`);
+    console.log(`[scraper] All network requests made: ${allRequests.length}`);
 
     if (deduped.length > 0) {
       cameraCache = {
@@ -195,14 +283,18 @@ async function scrapeDeFlock() {
       saveCache();
       return { success: true, count: deduped.length };
     } else {
-      console.warn('[scraper] No cameras found — site may have changed structure');
-      cameraCache.error = 'Scrape completed but no cameras found — deflock.me may have changed their API';
+      // Log what we saw to help debug
+      const urlLog = allRequests.slice(0, 30).map(r => `${r.status} ${r.url}`).join(' | ');
+      const errMsg = `Scrape found 0 cameras. Network requests seen: ${allRequests.length}. URLs: ${urlLog}`;
+      console.warn('[scraper]', errMsg);
+      cameraCache.error = errMsg;
       cameraCache.fetchedAt = new Date().toISOString();
+      saveCache();
       return { success: false, count: 0 };
     }
 
   } catch(err) {
-    console.error('[scraper] Error:', err.message);
+    console.error('[scraper] Fatal error:', err.message);
     if (browser) { try { await browser.close(); } catch(e) {} }
     cameraCache.error = err.message;
     cameraCache.fetchedAt = new Date().toISOString();
@@ -332,6 +424,7 @@ app.get('/status', (req, res) => {
     source:    cameraCache.source,
     error:     cameraCache.error || null,
     nextScrape:'Every 6 hours (cron)',
+    tip: cameraCache.count === 0 ? 'POST /scrape to trigger a fresh attempt' : null,
   });
 });
 
