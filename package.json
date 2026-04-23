@@ -11,7 +11,8 @@
     "express": "^4.18.2",
     "playwright": "^1.41.0",
     "node-cron": "^3.0.3",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "node-fetch": "^3.3.2"
   },
   "engines": {
     "node": ">=18.0.0"

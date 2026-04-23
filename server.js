@@ -61,37 +61,205 @@ function saveCache() {
 
 // ── SCRAPER ────────────────────────────────────────────
 async function scrapeDeFlock() {
-  console.log('[scraper] Starting DeFlock.me scrape…');
+  console.log('[scraper] Starting DeFlock scrape…');
   let browser;
   const intercepted = [];
   let apiEndpointFound = null;
-  const allRequests = []; // log every network request URL
+  const allRequests = [];
 
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-web-security',
-        '--allow-running-insecure-content',
-      ]
-    });
+    // ── Strategy 1: Hit CDN directly (no browser needed) ──
+    // deflock.me CDN serves alpr-counts.json and likely camera GeoJSON
+    const cdnUrls = [
+      'https://cdn.deflock.me/alpr-counts.json',
+      'https://cdn.deflock.me/cameras.json',
+      'https://cdn.deflock.me/cameras.geojson',
+      'https://cdn.deflock.me/locations.json',
+      'https://cdn.deflock.me/flock-cameras.json',
+      'https://cdn.deflock.me/flock-cameras.geojson',
+      'https://cdn.deflock.me/data.json',
+      'https://cdn.deflock.me/markers.json',
+    ];
 
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-      viewport: { width: 1440, height: 900 },
-      locale: 'en-US',
-      timezoneId: 'America/Chicago',
-      extraHTTPHeaders: {
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    const { default: fetch } = await import('node-fetch').catch(() => ({ default: global.fetch }));
+    const nodeFetch = fetch || global.fetch;
+
+    for (const url of cdnUrls) {
+      try {
+        console.log(`[cdn] Trying ${url}…`);
+        const r = await nodeFetch(url, {
+          headers: {
+            'Accept': 'application/json, application/geo+json, */*',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36',
+            'Referer': 'https://deflock.org/',
+            'Origin': 'https://deflock.org',
+          }
+        });
+        if (!r.ok) { console.log(`[cdn] ${url} → ${r.status}`); continue; }
+        const data = await r.json();
+        console.log(`[cdn] ${url} → 200, keys: ${Object.keys(data).slice(0,8).join(',')}`);
+        const parsed = parseCameraData(data);
+        if (parsed.length > 0) {
+          console.log(`[cdn] ✓ ${parsed.length} cameras from ${url}`);
+          apiEndpointFound = url;
+          intercepted.push(...parsed);
+          break;
+        } else {
+          // Log the raw structure so we can see what format it's in
+          console.log(`[cdn] Data structure: ${JSON.stringify(data).slice(0, 300)}`);
+        }
+      } catch(e) {
+        console.log(`[cdn] ${url} error: ${e.message}`);
       }
-    });
+    }
 
-    const page = await context.newPage();
+    // ── Strategy 2: Browser — target deflock.org directly ──
+    if (intercepted.length === 0) {
+      console.log('[scraper] CDN direct failed — launching browser targeting deflock.org…');
+
+      browser = await chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-web-security']
+      });
+
+      const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        viewport: { width: 1440, height: 900 },
+        locale: 'en-US',
+      });
+
+      const page = await context.newPage();
+
+      // Intercept ALL responses from any domain
+      page.on('response', async response => {
+        const url = response.url();
+        const ct  = response.headers()['content-type'] || '';
+        allRequests.push(url);
+
+        if (ct.includes('json') || ct.includes('geo') || url.endsWith('.json') || url.endsWith('.geojson')) {
+          try {
+            const body = await response.json().catch(() => null);
+            if (!body) return;
+            // Log raw structure for debugging
+            if (typeof body === 'object') {
+              console.log(`[intercept] ${url} → keys: ${Object.keys(body).slice(0,6).join(',')}, sample: ${JSON.stringify(body).slice(0,200)}`);
+            }
+            const parsed = parseCameraData(body);
+            if (parsed.length > 0) {
+              console.log(`[intercept] ✓ ${parsed.length} cameras from ${url}`);
+              apiEndpointFound = url;
+              intercepted.push(...parsed);
+            }
+          } catch(e) {}
+        }
+      });
+
+      // Go directly to deflock.org (that's where it redirects)
+      console.log('[scraper] Navigating to deflock.org…');
+      try {
+        await page.goto('https://deflock.org', { waitUntil: 'networkidle', timeout: 45000 });
+      } catch(e) {
+        console.log('[scraper] networkidle timeout, continuing…');
+      }
+      await page.waitForTimeout(4000);
+
+      // Try to navigate to the map page specifically
+      try {
+        await page.goto('https://deflock.org/map', { waitUntil: 'networkidle', timeout: 20000 });
+        await page.waitForTimeout(4000);
+      } catch(e) {}
+
+      // Try clicking any map/explore links
+      try {
+        const mapLink = await page.$('a[href*="map"], a:has-text("Map"), a:has-text("Explore"), button:has-text("Map")');
+        if (mapLink) { await mapLink.click(); await page.waitForTimeout(3000); }
+      } catch(e) {}
+
+      // In-browser fetches from deflock.org context (passes CORS)
+      if (intercepted.length === 0) {
+        const orgPaths = [
+          '/api/cameras', '/api/v1/cameras', '/cameras.geojson', '/cameras.json',
+          '/api/locations', '/api/markers', '/api/map/data', '/api/data',
+          '/api/flock', '/api/alpr', '/api/reports',
+        ];
+        for (const p of orgPaths) {
+          if (intercepted.length > 0) break;
+          try {
+            const result = await page.evaluate(async (path) => {
+              try {
+                const r = await fetch(path, { credentials: 'include', headers: { 'Accept': 'application/json,*/*' } });
+                if (!r.ok) return null;
+                return await r.json();
+              } catch(e) { return null; }
+            }, p);
+            if (result) {
+              console.log(`[org-fetch] ${p} → ${JSON.stringify(result).slice(0,200)}`);
+              const parsed = parseCameraData(result);
+              if (parsed.length > 0) { apiEndpointFound = 'https://deflock.org' + p; intercepted.push(...parsed); }
+            }
+          } catch(e) {}
+        }
+      }
+
+      // Also try cdn.deflock.me from browser context
+      if (intercepted.length === 0) {
+        try {
+          const cdnResult = await page.evaluate(async () => {
+            const urls = [
+              'https://cdn.deflock.me/alpr-counts.json',
+              'https://cdn.deflock.me/cameras.json',
+              'https://cdn.deflock.me/cameras.geojson',
+            ];
+            for (const url of urls) {
+              try {
+                const r = await fetch(url, { headers: { 'Accept': 'application/json,*/*' } });
+                if (r.ok) {
+                  const data = await r.json();
+                  return { url, data };
+                }
+              } catch(e) {}
+            }
+            return null;
+          });
+          if (cdnResult) {
+            console.log(`[cdn-browser] ${cdnResult.url} → ${JSON.stringify(cdnResult.data).slice(0,300)}`);
+            const parsed = parseCameraData(cdnResult.data);
+            if (parsed.length > 0) { apiEndpointFound = cdnResult.url; intercepted.push(...parsed); }
+          }
+        } catch(e) {}
+      }
+
+      await browser.close();
+      browser = null;
+    }
+
+    const deduped = deduplicateCameras(intercepted);
+    console.log(`[scraper] Done — ${deduped.length} unique cameras.`);
+
+    if (deduped.length > 0) {
+      cameraCache = {
+        cameras: deduped, fetchedAt: new Date().toISOString(),
+        count: deduped.length, source: apiEndpointFound || 'intercepted', error: null,
+      };
+      saveCache();
+      return { success: true, count: deduped.length };
+    } else {
+      const errMsg = `0 cameras found. Requests seen: ${allRequests.slice(0,10).join(' | ')}`;
+      console.warn('[scraper]', errMsg);
+      cameraCache.error = errMsg;
+      cameraCache.fetchedAt = new Date().toISOString();
+      saveCache();
+      return { success: false, count: 0 };
+    }
+
+  } catch(err) {
+    console.error('[scraper] Fatal:', err.message);
+    if (browser) { try { await browser.close(); } catch(e) {} }
+    cameraCache.error = err.message;
+    cameraCache.fetchedAt = new Date().toISOString();
+    return { success: false, error: err.message };
+  }
+}
 
     // ── Strategy 1: Intercept ALL network responses ────
     page.on('response', async response => {
