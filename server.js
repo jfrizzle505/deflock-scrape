@@ -531,6 +531,39 @@ function deduplicateCameras(cams) {
 
 // ── ROUTES ─────────────────────────────────────────────
 
+// Debug — fetch CDN directly and show raw response
+app.get('/debug', async (req, res) => {
+  const results = {};
+  const urls = [
+    'https://cdn.deflock.me/alpr-counts.json',
+    'https://cdn.deflock.me/cameras.json',
+    'https://cdn.deflock.me/cameras.geojson',
+    'https://deflock.org/api/cameras',
+  ];
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, {
+        headers: {
+          'Accept': 'application/json, */*',
+          'Referer': 'https://deflock.org/',
+          'Origin': 'https://deflock.org',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36',
+        }
+      });
+      const text = await r.text();
+      results[url] = {
+        status: r.status,
+        contentType: r.headers.get('content-type'),
+        // First 500 chars of response so we can see the structure
+        preview: text.slice(0, 500),
+      };
+    } catch(e) {
+      results[url] = { error: e.message };
+    }
+  }
+  res.json(results);
+});
+
 // Health check
 app.get('/', (req, res) => {
   res.json({
@@ -596,7 +629,16 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Manual trigger (protected by simple token)
+// Manual trigger — works as both GET and POST
+app.get('/scrape', async (req, res) => {
+  const token = req.headers['x-scrape-token'] || req.query.token;
+  if (process.env.SCRAPE_TOKEN && token !== process.env.SCRAPE_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.json({ message: 'Scrape started — check /status in 60 seconds' });
+  scrapeDeFlock().catch(console.error);
+});
+
 app.post('/scrape', async (req, res) => {
   const token = req.headers['x-scrape-token'] || req.query.token;
   if (process.env.SCRAPE_TOKEN && token !== process.env.SCRAPE_TOKEN) {
